@@ -38,6 +38,7 @@ def upload_to_drive(file_path, file_name, folder_id):
         body=file_metadata,
         media_body=media,
         fields="id"
+        supportsAllDrives=True   # 👈 ADD THIS
     ).execute()
 
     return uploaded_file.get("id")
