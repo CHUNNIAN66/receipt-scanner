@@ -140,7 +140,6 @@ def create_google_flow():
         },
         scopes=["https://www.googleapis.com/auth/drive.file"],
         redirect_uri=st.secrets["auth"]["redirect_uri"],
-        autogenerate_code_verifier=True,
     )
     return flow
 
@@ -158,22 +157,12 @@ def google_login_section():
         try:
             code = query_params["code"]
 
-            if "code_verifier" not in st.query_params:
-                st.error("Google login session expired. Please click Login with Google Drive again.")
-                st.query_params.clear()
-                return
-
             flow = create_google_flow()
-            code_verifier = st.query_params.get("code_verifier")
-            flow.code_verifier = code_verifier
-
-            flow.fetch_token(
-                code=code,
-                code_verifier=st.session_state["google_code_verifier"],
-            )
+            flow.fetch_token(code=code)
 
             st.session_state["google_credentials"] = flow.credentials
             st.query_params.clear()
+
             st.success("✅ Google Drive connected")
             st.rerun()
 
@@ -189,9 +178,6 @@ def google_login_section():
         include_granted_scopes="true",
         prompt="consent",
     )
-
-    st.session_state["google_oauth_state"] = state
-    st.query_params["code_verifier"] = flow.code_verifier
 
     st.markdown(f"[Login with Google Drive]({auth_url})")
 
