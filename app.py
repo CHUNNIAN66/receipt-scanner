@@ -158,13 +158,14 @@ def google_login_section():
         try:
             code = query_params["code"]
 
-            if "google_code_verifier" not in st.session_state:
+            if "code_verifier" not in st.query_params:
                 st.error("Google login session expired. Please click Login with Google Drive again.")
                 st.query_params.clear()
                 return
 
             flow = create_google_flow()
-            flow.code_verifier = st.session_state["google_code_verifier"]
+            code_verifier = st.query_params.get("code_verifier")
+            flow.code_verifier = code_verifier
 
             flow.fetch_token(
                 code=code,
@@ -190,7 +191,7 @@ def google_login_section():
     )
 
     st.session_state["google_oauth_state"] = state
-    st.session_state["google_code_verifier"] = flow.code_verifier
+    st.query_params["code_verifier"] = flow.code_verifier
 
     st.markdown(f"[Login with Google Drive]({auth_url})")
 
