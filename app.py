@@ -37,7 +37,7 @@ def upload_to_drive(file_path, file_name, folder_id):
     uploaded_file = service.files().create(
         body=file_metadata,
         media_body=media,
-        fields="id"
+        fields="id",
         supportsAllDrives=True,   # 👈 ADD THIS
     ).execute()
 
