@@ -1,47 +1,21 @@
-import streamlit as st
-import pandas as pd
-import pytesseract
-from PIL import Image
 import os
-from datetime import datetime
 import json
-from openai import OpenAI
+from datetime import datetime
+
 import cv2
 import numpy as np
-from google.oauth2 import service_account
+import pandas as pd
+import pytesseract
+import streamlit as st
+from PIL import Image
+from openai import OpenAI
+
+from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-BASE_PATH = os.path.expanduser("~/Documents/Receipt_Records")
 
-
-def get_drive_service():
-    creds_dict = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
-    creds = service_account.Credentials.from_service_account_info(
-        creds_dict,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=creds)
-
-
-def upload_to_drive(file_path, file_name, folder_id):
-    service = get_drive_service()
-
-    file_metadata = {
-        "name": file_name,
-        "parents": [folder_id]
-    }
-
-    media = MediaFileUpload(file_path, resumable=True)
-
-    uploaded_file = service.files().create(
-        body=file_metadata,
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True,   # 👈 ADD THIS
-    ).execute()
-
-    return uploaded_file.get("id")
+BASE_PATH = "/tmp/Receipt_Records"
 
 
 def get_financial_year(date):
@@ -106,8 +80,6 @@ Rules:
 - If quantity and unit price are visible, calculate Amount = Qty * Unit Price.
 - If line total is visible on the right, use that as Amount.
 - If OCR is messy, infer the most likely item rows.
-- For Bunnings receipts, items may look like:
-  "MULCH RICHGRO 40L PINE BARK 3 @ $13.92 $41.76"
 - Return Amount as number, not string.
 
 OCR text:
@@ -165,7 +137,92 @@ def save_to_excel(rows, date):
     return file_path
 
 
-st.title("📸 Receipt Scanner - GPT Version")
+def create_google_flow():
+    return Flow.from_client_config(
+        {
+            "web": {
+                "client_id": st.secrets["auth"]["client_id"],
+                "client_secret": st.secrets["auth"]["client_secret"],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [st.secrets["auth"]["redirect_uri"]],
+            }
+        },
+        scopes=["https://www.googleapis.com/auth/drive.file"],
+        redirect_uri=st.secrets["auth"]["redirect_uri"],
+    )
+
+
+def google_login_section():
+    st.subheader("Google Drive Login")
+
+    if "google_credentials" in st.session_state:
+        st.success("✅ Google Drive connected")
+        return
+
+    query_params = st.query_params
+
+    if "code" in query_params:
+        try:
+            code = query_params["code"]
+
+            flow = create_google_flow()
+            flow.fetch_token(code=code)
+
+            st.session_state["google_credentials"] = flow.credentials
+            st.query_params.clear()
+            st.success("✅ Google Drive connected")
+            st.rerun()
+
+        except Exception as e:
+            st.error("Google login failed")
+            st.exception(e)
+            return
+
+    flow = create_google_flow()
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+
+    st.markdown(f"[Login with Google Drive]({auth_url})")
+
+
+def get_drive_service_oauth():
+    if "google_credentials" not in st.session_state:
+        return None
+
+    credentials = st.session_state["google_credentials"]
+    return build("drive", "v3", credentials=credentials)
+
+
+def upload_to_drive(file_path, file_name, folder_id):
+    service = get_drive_service_oauth()
+
+    if service is None:
+        st.error("Please login to Google Drive first")
+        return None
+
+    file_metadata = {
+        "name": file_name,
+        "parents": [folder_id],
+    }
+
+    media = MediaFileUpload(file_path, resumable=True)
+
+    uploaded_file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id",
+    ).execute()
+
+    return uploaded_file.get("id")
+
+
+st.title("📸 Receipt Scanner - GPT + Personal Google Drive")
+
+google_login_section()
 
 uploaded_file = st.file_uploader(
     "Upload receipt image",
@@ -218,7 +275,7 @@ if uploaded_file:
         payment_method = st.text_input("Payment Method", value="")
         receipt_date = st.date_input("Receipt Date", value=datetime.today())
 
-        if st.button("Confirm and Write to Excel"):
+        if st.button("Confirm and Save"):
             date_obj = datetime.combine(receipt_date, datetime.min.time())
 
             edited_df["Amount"] = pd.to_numeric(
@@ -248,15 +305,46 @@ if uploaded_file:
                     "Category": category,
                     "Project / Investor": project,
                     "Payment Method": payment_method,
-                    "Image Path": image_path
+                    "Image Path": os.path.basename(image_path)
                 })
 
             excel_path = save_to_excel(rows, date_obj)
 
-            folder_id = "1r5NBjq0I8sTuwS9pJ9tm7B4FBt6c8_2D"
-            upload_to_drive(excel_path, "receipts.xlsx", folder_id)
-            upload_to_drive(image_path, os.path.basename(image_path), folder_id)
+            folder_id = st.secrets["DRIVE_FOLDER_ID"]
 
-            st.success("✅ Saved to Excel, receipt image archived, and uploaded to Google Drive")
-            st.write("Excel file:", excel_path)
-            st.write("Receipt image:", image_path)
+            try:
+                excel_drive_id = upload_to_drive(
+                    excel_path,
+                    os.path.basename(excel_path),
+                    folder_id
+                )
+
+                image_drive_id = upload_to_drive(
+                    image_path,
+                    os.path.basename(image_path),
+                    folder_id
+                )
+
+                st.success("✅ Saved and uploaded to your Google Drive")
+                st.write("Excel Drive file ID:", excel_drive_id)
+                st.write("Receipt image Drive file ID:", image_drive_id)
+
+            except Exception as e:
+                st.error("Google Drive upload failed")
+                st.exception(e)
+
+            with open(excel_path, "rb") as f:
+                st.download_button(
+                    "Download Excel backup",
+                    f,
+                    file_name=os.path.basename(excel_path),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+            with open(image_path, "rb") as f:
+                st.download_button(
+                    "Download Receipt backup",
+                    f,
+                    file_name=os.path.basename(image_path),
+                    mime="image/jpeg"
+                )
