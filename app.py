@@ -8,6 +8,36 @@ import json
 from openai import OpenAI
 import cv2
 import numpy as np
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import json
+
+def get_drive_service():
+    creds_dict = json.loads(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+    creds = service_account.Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/drive"]
+    )
+    return build("drive", "v3", credentials=creds)
+
+def upload_to_drive(file_path, file_name, folder_id):
+    service = get_drive_service()
+
+    file_metadata = {
+        "name": file_name,
+        "parents": [folder_id]
+    }
+
+    media = MediaFileUpload(file_path, resumable=True)
+
+    file = service.files().create(
+        body=file_metadata,
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    return file.get("id")
 
 BASE_PATH = os.path.expanduser("~/Documents/Receipt_Records")
 
@@ -186,41 +216,43 @@ if uploaded_file:
         payment_method = st.text_input("Payment Method", value="")
         receipt_date = st.date_input("Receipt Date", value=datetime.today())
 
-        if st.button("Confirm and Write to Excel"):
-            date_obj = datetime.combine(receipt_date, datetime.min.time())
+       if st.button("Confirm and Write to Excel"):
+    date_obj = datetime.combine(receipt_date, datetime.min.time())
 
-            edited_df["Amount"] = pd.to_numeric(
-                edited_df["Amount"],
-                errors="coerce"
-            ).fillna(0)
+    edited_df["Amount"] = pd.to_numeric(
+        edited_df["Amount"],
+        errors="coerce"
+    ).fillna(0)
 
-            total_amount = edited_df["Amount"].sum()
+    total_amount = edited_df["Amount"].sum()
 
-            image_path = save_image(
-                original_image,
-                store,
-                date_obj,
-                round(float(total_amount), 2)
-            )
+    image_path = save_image(
+        original_image,
+        store,
+        date_obj,
+        round(float(total_amount), 2)
+    )
 
-            rows = []
+    rows = []
 
-            for _, row in edited_df.iterrows():
-                rows.append({
-                    "Date": date_obj.strftime("%Y-%m-%d"),
-                    "Store": store,
-                    "Item": row.get("Item", ""),
-                    "Qty": row.get("Qty", ""),
-                    "Unit Price": row.get("Unit Price", ""),
-                    "Amount": row.get("Amount", ""),
-                    "Category": category,
-                    "Project / Investor": project,
-                    "Payment Method": payment_method,
-                    "Image Path": image_path
-                })
+    for _, row in edited_df.iterrows():
+        rows.append({
+            "Date": date_obj.strftime("%Y-%m-%d"),
+            "Store": store,
+            "Item": row.get("Item", ""),
+            "Qty": row.get("Qty", ""),
+            "Unit Price": row.get("Unit Price", ""),
+            "Amount": row.get("Amount", ""),
+            "Category": category,
+            "Project / Investor": project,
+            "Payment Method": payment_method,
+            "Image Path": image_path
+        })
 
-            excel_path = save_to_excel(rows, date_obj)
+    excel_path = save_to_excel(rows, date_obj)
 
-            st.success("✅ Saved to Excel and receipt image archived")
-            st.write("Excel file:", excel_path)
-            st.write("Receipt image:", image_path)
+    folder_id = "1r5NBjq0I8sTuwS9pJ9tm7B4FBt6c8_2D"
+    upload_to_drive(excel_path, "receipts.xlsx", folder_id)
+    upload_to_drive(image_path, os.path.basename(image_path), folder_id)
+
+    st.success("✅ Saved to Excel, receipt image archived, and uploaded to Google Drive")
