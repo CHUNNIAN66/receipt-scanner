@@ -159,11 +159,8 @@ def google_login_section():
             code = query_params["code"]
 
             flow = create_google_flow()
-            flow.fetch_token(
-            code=code,
-            redirect_uri=st.secrets["auth"]["redirect_uri"]
-        )
-
+            flow.fetch_token(code=code)
+         
             st.session_state["google_credentials"] = flow.credentials
             st.query_params.clear()
 
