@@ -47,12 +47,7 @@ def preprocess_image(image):
 
 def ocr_image(image):
     processed = preprocess_image(image)
-
-    text = pytesseract.image_to_string(
-        processed,
-        config="--psm 6"
-    )
-
+    text = pytesseract.image_to_string(processed, config="--psm 6")
     return text, processed
 
 
@@ -103,7 +98,6 @@ OCR text:
 
 def save_image(original_image, store, date, total="unknown"):
     fy = get_financial_year(date)
-
     folder = os.path.join(BASE_PATH, fy, store)
     os.makedirs(folder, exist_ok=True)
 
@@ -112,18 +106,15 @@ def save_image(original_image, store, date, total="unknown"):
     path = os.path.join(folder, filename)
 
     original_image.convert("RGB").save(path)
-
     return path
 
 
 def save_to_excel(rows, date):
     fy = get_financial_year(date)
-
     folder = os.path.join(BASE_PATH, fy, "Excel")
     os.makedirs(folder, exist_ok=True)
 
     file_path = os.path.join(folder, f"{fy}_Expense_Receipts.xlsx")
-
     new_df = pd.DataFrame(rows)
 
     if os.path.exists(file_path):
@@ -133,12 +124,11 @@ def save_to_excel(rows, date):
         final_df = new_df
 
     final_df.to_excel(file_path, index=False)
-
     return file_path
 
 
 def create_google_flow():
-    return Flow.from_client_config(
+    flow = Flow.from_client_config(
         {
             "web": {
                 "client_id": st.secrets["auth"]["client_id"],
@@ -150,7 +140,9 @@ def create_google_flow():
         },
         scopes=["https://www.googleapis.com/auth/drive.file"],
         redirect_uri=st.secrets["auth"]["redirect_uri"],
+        autogenerate_code_verifier=True,
     )
+    return flow
 
 
 def google_login_section():
@@ -166,8 +158,18 @@ def google_login_section():
         try:
             code = query_params["code"]
 
+            if "google_code_verifier" not in st.session_state:
+                st.error("Google login session expired. Please click Login with Google Drive again.")
+                st.query_params.clear()
+                return
+
             flow = create_google_flow()
-            flow.fetch_token(code=code)
+            flow.code_verifier = st.session_state["google_code_verifier"]
+
+            flow.fetch_token(
+                code=code,
+                code_verifier=st.session_state["google_code_verifier"],
+            )
 
             st.session_state["google_credentials"] = flow.credentials
             st.query_params.clear()
@@ -180,11 +182,15 @@ def google_login_section():
             return
 
     flow = create_google_flow()
-    auth_url, _ = flow.authorization_url(
+
+    auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
+
+    st.session_state["google_oauth_state"] = state
+    st.session_state["google_code_verifier"] = flow.code_verifier
 
     st.markdown(f"[Login with Google Drive]({auth_url})")
 
@@ -309,7 +315,6 @@ if uploaded_file:
                 })
 
             excel_path = save_to_excel(rows, date_obj)
-
             folder_id = st.secrets["DRIVE_FOLDER_ID"]
 
             try:
@@ -325,9 +330,10 @@ if uploaded_file:
                     folder_id
                 )
 
-                st.success("✅ Saved and uploaded to your Google Drive")
-                st.write("Excel Drive file ID:", excel_drive_id)
-                st.write("Receipt image Drive file ID:", image_drive_id)
+                if excel_drive_id and image_drive_id:
+                    st.success("✅ Saved and uploaded to your Google Drive")
+                    st.write("Excel Drive file ID:", excel_drive_id)
+                    st.write("Receipt image Drive file ID:", image_drive_id)
 
             except Exception as e:
                 st.error("Google Drive upload failed")
