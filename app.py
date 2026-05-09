@@ -146,6 +146,7 @@ def create_google_flow():
 
 def google_login_section():
     st.subheader("Google Drive Login")
+    st.write("OAuth version: no PKCE")
 
     if "google_credentials" in st.session_state:
         st.success("✅ Google Drive connected")
