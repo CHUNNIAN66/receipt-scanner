@@ -53,20 +53,34 @@ def preprocess_versions(image):
 
 
 def ocr_image(image):
-    versions = preprocess_versions(image)
+    img = np.array(image.convert("RGB"))
 
-    best_text = ""
-    best_img = versions[0]
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
 
-    for v in versions:
-        pil_img = Image.fromarray(v)
-        text = pytesseract.image_to_string(pil_img, config="--psm 6")
+    gray = cv2.fastNlMeansDenoising(gray, None, 20, 7, 21)
 
-        if len(text.strip()) > len(best_text.strip()):
-            best_text = text
-            best_img = pil_img
+    processed = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        41,
+        15
+    )
 
-    return best_text, best_img
+    pil_img = Image.fromarray(processed)
+
+    config = (
+        "--oem 3 --psm 6 "
+        "-l eng "
+        "-c preserve_interword_spaces=1 "
+        "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.$:/-%#&() "
+    )
+
+    text = pytesseract.image_to_string(pil_img, config=config)
+
+    return text, pil_img
 
 
 def parse_items_with_gpt(text):
