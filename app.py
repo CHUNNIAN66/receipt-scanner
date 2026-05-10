@@ -1,4 +1,5 @@
 import os
+import io
 import json
 from datetime import datetime
 
@@ -12,7 +13,7 @@ from openai import OpenAI
 
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 
 BASE_PATH = "/tmp/Receipt_Records"
@@ -26,7 +27,6 @@ def get_financial_year(date):
 
 def preprocess_versions(image):
     img = np.array(image.convert("RGB"))
-
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
     versions = []
@@ -97,6 +97,7 @@ Rules:
 - Australian receipt prices usually appear like 3.50, 12.99, 120.00.
 - If quantity and unit price are visible, calculate Amount = Qty * Unit Price.
 - If line total is visible on the right, use that as Amount.
+- If no clear amount is visible, use 0.
 - Return Amount as number, not string.
 
 OCR text:
@@ -236,9 +237,77 @@ def upload_to_drive(file_path, file_name, folder_id):
     return uploaded_file.get("id")
 
 
+def find_drive_file(file_name, folder_id):
+    service = get_drive_service_oauth()
+
+    query = (
+        f"name='{file_name}' "
+        f"and '{folder_id}' in parents "
+        f"and trashed=false"
+    )
+
+    results = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name, modifiedTime)"
+    ).execute()
+
+    files = results.get("files", [])
+
+    if files:
+        files = sorted(files, key=lambda x: x.get("modifiedTime", ""), reverse=True)
+        return files[0]["id"]
+
+    return None
+
+
+def download_drive_file(file_id, local_path):
+    service = get_drive_service_oauth()
+
+    request = service.files().get_media(fileId=file_id)
+
+    with io.FileIO(local_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+
+
+def update_drive_file(file_id, local_path):
+    service = get_drive_service_oauth()
+
+    media = MediaFileUpload(
+        local_path,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        resumable=True
+    )
+
+    updated_file = service.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields="id"
+    ).execute()
+
+    return updated_file.get("id")
+
+
+def upload_or_update_excel_to_drive(excel_path, file_name, folder_id):
+    existing_file_id = find_drive_file(file_name, folder_id)
+
+    if existing_file_id:
+        update_drive_file(existing_file_id, excel_path)
+        return existing_file_id
+
+    return upload_to_drive(excel_path, file_name, folder_id)
+
+
 st.title("📸 Receipt Scanner")
 
 google_login_section()
+
+if "google_credentials" not in st.session_state:
+    st.stop()
 
 uploaded_file = st.file_uploader(
     "Take or upload receipt photo",
@@ -249,7 +318,6 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
     original_image = Image.open(uploaded_file)
 
-    # Mobile optimization: compress large phone photos
     original_image.thumbnail((1600, 1600))
 
     st.subheader("Original Image")
@@ -339,16 +407,16 @@ if uploaded_file:
         payment_method = st.text_input("Payment Method", value="")
         receipt_date = st.date_input("Receipt Date", value=datetime.today())
 
+        edited_df["Amount"] = pd.to_numeric(
+            edited_df["Amount"],
+            errors="coerce"
+        ).fillna(0)
+
         total_amount = edited_df["Amount"].sum()
-        st.info(f"Total Amount: ${total_amount:.2f}")
+        st.warning(f"Please check total amount before saving: ${total_amount:.2f}")
 
         if st.button("✅ Confirm and Save", use_container_width=True):
             date_obj = datetime.combine(receipt_date, datetime.min.time())
-
-            edited_df["Amount"] = pd.to_numeric(
-                edited_df["Amount"],
-                errors="coerce"
-            ).fillna(0)
 
             total_amount = edited_df["Amount"].sum()
 
@@ -379,7 +447,7 @@ if uploaded_file:
             folder_id = st.secrets["DRIVE_FOLDER_ID"]
 
             try:
-                excel_drive_id = upload_to_drive(
+                excel_drive_id = upload_or_update_excel_to_drive(
                     excel_path,
                     os.path.basename(excel_path),
                     folder_id
@@ -392,7 +460,7 @@ if uploaded_file:
                 )
 
                 if excel_drive_id and image_drive_id:
-                    st.success("✅ Saved to Google Drive")
+                    st.success("✅ Saved to one yearly Excel file in Google Drive")
 
             except Exception as e:
                 st.error("Google Drive upload failed")
