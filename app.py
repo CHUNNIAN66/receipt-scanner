@@ -183,12 +183,22 @@ def google_login_section():
             flow.fetch_token(code=code)
 
             st.session_state["google_credentials"] = flow.credentials
-
+            
             user_email = get_google_user_email(flow.credentials)
+            
+            allowed = supabase.table("allowed_users") \
+                .select("*") \
+                .eq("email", user_email) \
+                .execute()
+            
+            if not allowed.data:
+                st.error("You are not authorized to use this app.")
+                st.stop()
+            
             st.session_state["user_email"] = user_email
-
+            
             ensure_user_setup(user_email)
-
+            
             st.query_params.clear()
 
             st.success(f"✅ Logged in as {user_email}")
