@@ -72,7 +72,7 @@ def ocr_image(image):
     pil_img = Image.fromarray(processed)
 
     config = (
-        "--oem 3 --psm 6 "
+        "--oem 3 --psm 4 "
         "-l eng "
         "-c preserve_interword_spaces=1 "
         "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.$:/-%#&() "
