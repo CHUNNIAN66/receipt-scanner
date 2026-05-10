@@ -14,6 +14,7 @@ from supabase import create_client
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 
 BASE_PATH = "/tmp/Receipt_Records"
@@ -435,22 +436,57 @@ def save_image_local(original_image, store, date, total="unknown"):
     return path
 
 
-def save_to_excel(rows, date):
+def save_to_excel(rows, date, root_folder_id):
     fy = get_financial_year(date)
 
     folder = os.path.join(BASE_PATH, fy, "Excel")
     os.makedirs(folder, exist_ok=True)
 
-    file_path = os.path.join(folder, f"{fy}_Expense_Receipts.xlsx")
+    file_name = f"{fy}_Expense_Receipts.xlsx"
+    file_path = os.path.join(folder, file_name)
 
     new_df = pd.DataFrame(rows)
 
-    if os.path.exists(file_path):
-        old_df = pd.read_excel(file_path)
-        final_df = pd.concat([old_df, new_df], ignore_index=True)
+    existing_file_id = find_drive_file(
+        file_name,
+        root_folder_id
+    )
+
+    # =========================
+    # DOWNLOAD EXISTING EXCEL
+    # =========================
+    if existing_file_id:
+        service = get_drive_service_oauth()
+
+        request = service.files().get_media(
+            fileId=existing_file_id
+        )
+
+        with open(file_path, "wb") as f:
+            downloader = MediaIoBaseDownload(f, request)
+
+            done = False
+
+            while not done:
+                status, done = downloader.next_chunk()
+
+        try:
+            old_df = pd.read_excel(file_path)
+
+            final_df = pd.concat(
+                [old_df, new_df],
+                ignore_index=True
+            )
+
+        except Exception:
+            final_df = new_df
+
     else:
         final_df = new_df
 
+    # =========================
+    # SAVE LOCAL
+    # =========================
     final_df.to_excel(file_path, index=False)
 
     return file_path
@@ -590,10 +626,14 @@ if uploaded_file:
                     "Image Path": os.path.basename(image_path)
                 })
 
-            excel_path = save_to_excel(rows, date_obj)
-
             user_email = st.session_state["user_email"]
             root_folder_id = get_user_root_folder_id(user_email)
+            
+            excel_path = save_to_excel(
+                rows,
+                date_obj,
+                root_folder_id
+            )
 
             try:
                 excel_drive_id = upload_or_update_excel_to_drive(
