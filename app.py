@@ -1,5 +1,4 @@
 import os
-import io
 import json
 import base64
 from datetime import datetime
@@ -15,7 +14,7 @@ from openai import OpenAI
 
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaFileUpload
 
 
 BASE_PATH = "/tmp/Receipt_Records"
@@ -27,6 +26,16 @@ def get_financial_year(date):
     return f"FY{date.year - 1}-{date.year}"
 
 
+def safe_name(name):
+    return str(name).replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+
+def compress_image_for_processing(image):
+    image = ImageOps.exif_transpose(image)
+    image.thumbnail((1200, 1200))
+    return image
+
+
 def ocr_image(image):
     img = np.array(image.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
@@ -34,21 +43,15 @@ def ocr_image(image):
     gray = cv2.fastNlMeansDenoising(gray, None, 20, 7, 21)
 
     processed = cv2.adaptiveThreshold(
-        gray,
-        255,
+        gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        41,
-        15
+        41, 15
     )
 
     pil_img = Image.fromarray(processed)
 
-    config = (
-        "--oem 3 --psm 6 "
-        "-l eng "
-        "-c preserve_interword_spaces=1"
-    )
+    config = "--oem 3 --psm 6 -l eng -c preserve_interword_spaces=1"
 
     text = pytesseract.image_to_string(pil_img, config=config)
     return text, pil_img
@@ -58,7 +61,12 @@ def parse_receipt_image_with_gpt(image):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
     buffer = BytesIO()
-    image.convert("RGB").save(buffer, format="JPEG", quality=90)
+    image.convert("RGB").save(
+        buffer,
+        format="JPEG",
+        quality=70,
+        optimize=True
+    )
     image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     prompt = """
@@ -117,16 +125,21 @@ Rules:
         return []
 
 
-def save_image(original_image, store, date, total="unknown"):
+def save_image_local(original_image, store, date, total="unknown"):
     fy = get_financial_year(date)
-    folder = os.path.join(BASE_PATH, fy, store)
+    folder = os.path.join(BASE_PATH, fy, safe_name(store))
     os.makedirs(folder, exist_ok=True)
 
-    safe_store = store.replace("/", "_").replace(" ", "_")
-    filename = f"{date.strftime('%Y-%m-%d')}_{safe_store}_{total}.jpg"
+    filename = f"{date.strftime('%Y-%m-%d')}_{safe_name(store)}_{total}.jpg"
     path = os.path.join(folder, filename)
 
-    original_image.convert("RGB").save(path)
+    original_image.convert("RGB").save(
+        path,
+        format="JPEG",
+        quality=55,
+        optimize=True
+    )
+
     return path
 
 
@@ -287,6 +300,62 @@ def upload_or_update_excel_to_drive(excel_path, file_name, folder_id):
     return upload_to_drive(excel_path, file_name, folder_id)
 
 
+def get_or_create_drive_folder(folder_name, parent_folder_id):
+    service = get_drive_service_oauth()
+
+    query = (
+        f"name='{folder_name}' "
+        f"and mimeType='application/vnd.google-apps.folder' "
+        f"and '{parent_folder_id}' in parents "
+        f"and trashed=false"
+    )
+
+    results = service.files().list(
+        q=query,
+        spaces="drive",
+        fields="files(id, name)"
+    ).execute()
+
+    files = results.get("files", [])
+
+    if files:
+        return files[0]["id"]
+
+    metadata = {
+        "name": folder_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_folder_id],
+    }
+
+    folder = service.files().create(
+        body=metadata,
+        fields="id"
+    ).execute()
+
+    return folder.get("id")
+
+
+def get_receipt_image_folder_id(root_folder_id, date_obj, store):
+    fy = get_financial_year(date_obj)
+
+    images_folder_id = get_or_create_drive_folder(
+        "Receipt Images",
+        root_folder_id
+    )
+
+    fy_folder_id = get_or_create_drive_folder(
+        fy,
+        images_folder_id
+    )
+
+    store_folder_id = get_or_create_drive_folder(
+        store,
+        fy_folder_id
+    )
+
+    return store_folder_id
+
+
 st.title("📸 Receipt Scanner")
 
 google_login_section()
@@ -302,12 +371,7 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     original_image = Image.open(uploaded_file)
-
-    # Fix mobile photo rotation
-    original_image = ImageOps.exif_transpose(original_image)
-
-    # Compress large mobile photos
-    original_image.thumbnail((1600, 1600))
+    original_image = compress_image_for_processing(original_image)
 
     st.subheader("Original Image")
     st.image(original_image, use_container_width=True)
@@ -357,62 +421,40 @@ if uploaded_file:
                 "Amount": 0.0
             }])
 
-        edited_rows = []
+        required_columns = ["Item", "Qty", "Unit Price", "Amount"]
 
-        for i, row in st.session_state["items_df"].iterrows():
-            item_name = str(row.get("Item", ""))
+        for col in required_columns:
+            if col not in st.session_state["items_df"].columns:
+                st.session_state["items_df"][col] = ""
 
-            with st.expander(f"Item {i + 1}: {item_name}", expanded=True):
-                item = st.text_input(
+        st.session_state["items_df"] = st.session_state["items_df"][required_columns]
+
+        edited_df = st.data_editor(
+            st.session_state["items_df"],
+            num_rows="dynamic",
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Item": st.column_config.TextColumn(
                     "Item",
-                    value=str(row.get("Item", "")),
-                    key=f"item_{i}"
-                )
-
-                qty = st.text_input(
+                    width="large"
+                ),
+                "Qty": st.column_config.TextColumn(
                     "Qty",
-                    value=str(row.get("Qty", "")),
-                    key=f"qty_{i}"
-                )
-
-                unit_price = st.text_input(
+                    width="small"
+                ),
+                "Unit Price": st.column_config.TextColumn(
                     "Unit Price",
-                    value=str(row.get("Unit Price", "")),
-                    key=f"unit_{i}"
-                )
-
-                try:
-                    default_amount = float(row.get("Amount", 0) or 0)
-                except Exception:
-                    default_amount = 0.0
-
-                amount = st.number_input(
+                    width="small"
+                ),
+                "Amount": st.column_config.NumberColumn(
                     "Amount",
-                    value=default_amount,
+                    min_value=0.0,
                     step=0.01,
-                    key=f"amount_{i}"
-                )
-
-                edited_rows.append({
-                    "Item": item,
-                    "Qty": qty,
-                    "Unit Price": unit_price,
-                    "Amount": amount
-                })
-
-        if st.button("➕ Add another item", use_container_width=True):
-            st.session_state["items_df"] = pd.concat([
-                st.session_state["items_df"],
-                pd.DataFrame([{
-                    "Item": "",
-                    "Qty": "",
-                    "Unit Price": "",
-                    "Amount": 0.0
-                }])
-            ], ignore_index=True)
-            st.rerun()
-
-        edited_df = pd.DataFrame(edited_rows)
+                    format="$%.2f"
+                ),
+            }
+        )
 
         if edited_df.empty or "Amount" not in edited_df.columns:
             edited_df = pd.DataFrame([{
@@ -441,7 +483,7 @@ if uploaded_file:
         if st.button("✅ Confirm and Save", use_container_width=True):
             date_obj = datetime.combine(receipt_date, datetime.min.time())
 
-            image_path = save_image(
+            image_path = save_image_local(
                 original_image,
                 store,
                 date_obj,
@@ -465,23 +507,30 @@ if uploaded_file:
                 })
 
             excel_path = save_to_excel(rows, date_obj)
-            folder_id = st.secrets["DRIVE_FOLDER_ID"]
+
+            root_folder_id = st.secrets["DRIVE_FOLDER_ID"]
 
             try:
                 excel_drive_id = upload_or_update_excel_to_drive(
                     excel_path,
                     os.path.basename(excel_path),
-                    folder_id
+                    root_folder_id
+                )
+
+                receipt_image_folder_id = get_receipt_image_folder_id(
+                    root_folder_id,
+                    date_obj,
+                    store
                 )
 
                 image_drive_id = upload_to_drive(
                     image_path,
                     os.path.basename(image_path),
-                    folder_id
+                    receipt_image_folder_id
                 )
 
                 if excel_drive_id and image_drive_id:
-                    st.success("✅ Saved to one yearly Excel file in Google Drive")
+                    st.success("✅ Saved to yearly Excel and compressed receipt image folder in Google Drive")
 
             except Exception as e:
                 st.error("Google Drive upload failed")
@@ -498,7 +547,7 @@ if uploaded_file:
 
             with open(image_path, "rb") as f:
                 st.download_button(
-                    "Download Receipt backup",
+                    "Download Compressed Receipt backup",
                     f,
                     file_name=os.path.basename(image_path),
                     mime="image/jpeg",
