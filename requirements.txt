@@ -1,12 +1,9 @@
 streamlit
+openai
 pandas
 openpyxl
 pillow
-pytesseract
 opencv-python-headless
-numpy
-openai
-google-auth
+pytesseract
 google-auth-oauthlib
-google-auth-httplib2
 google-api-python-client
