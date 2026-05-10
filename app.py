@@ -113,14 +113,19 @@ Rules:
         ]
     )
 
-    raw = response.output_text.strip()
+raw = response.output_text.strip()
 
-    try:
-        return json.loads(raw)
-    except Exception:
-        st.error("GPT returned invalid JSON")
-        st.text(raw)
-        return []
+raw = raw.replace("```json", "")
+raw = raw.replace("```", "")
+raw = raw.strip()
+
+try:
+    return json.loads(raw)
+
+except Exception:
+    st.error("GPT returned invalid JSON")
+    st.text(raw)
+    return []
 
 
 # =========================
