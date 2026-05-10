@@ -146,7 +146,6 @@ def create_google_flow():
 
 def google_login_section():
     st.subheader("Google Drive Login")
-    st.write("OAuth version: no PKCE")
 
     if "google_credentials" in st.session_state:
         st.success("✅ Google Drive connected")
@@ -159,8 +158,13 @@ def google_login_section():
             code = query_params["code"]
 
             flow = create_google_flow()
+
+            # restore saved PKCE verifier
+            if "google_code_verifier" in st.session_state:
+                flow.code_verifier = st.session_state["google_code_verifier"]
+
             flow.fetch_token(code=code)
-         
+
             st.session_state["google_credentials"] = flow.credentials
             st.query_params.clear()
 
@@ -179,6 +183,10 @@ def google_login_section():
         include_granted_scopes="true",
         prompt="consent",
     )
+
+    # save PKCE verifier before redirect
+    st.session_state["google_code_verifier"] = flow.code_verifier
+    st.session_state["google_oauth_state"] = state
 
     st.markdown(f"[Login with Google Drive]({auth_url})")
 
