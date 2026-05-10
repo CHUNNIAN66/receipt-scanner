@@ -140,7 +140,9 @@ def create_google_flow():
         },
         scopes=["https://www.googleapis.com/auth/drive.file"],
         redirect_uri=st.secrets["auth"]["redirect_uri"],
+        autogenerate_code_verifier=False
     )
+
     return flow
 
 
