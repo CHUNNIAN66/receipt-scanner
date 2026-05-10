@@ -1,14 +1,16 @@
 import os
 import io
 import json
+import base64
 from datetime import datetime
+from io import BytesIO
 
 import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
 from openai import OpenAI
 
 from google_auth_oauthlib.flow import Flow
@@ -25,39 +27,10 @@ def get_financial_year(date):
     return f"FY{date.year - 1}-{date.year}"
 
 
-def preprocess_versions(image):
-    img = np.array(image.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-
-    versions = []
-
-    versions.append(gray)
-
-    resized = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    versions.append(resized)
-
-    threshold = cv2.threshold(resized, 150, 255, cv2.THRESH_BINARY)[1]
-    versions.append(threshold)
-
-    adaptive = cv2.adaptiveThreshold(
-        resized,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        11
-    )
-    versions.append(adaptive)
-
-    return versions
-
-
 def ocr_image(image):
     img = np.array(image.convert("RGB"))
-
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-
     gray = cv2.fastNlMeansDenoising(gray, None, 20, 7, 21)
 
     processed = cv2.adaptiveThreshold(
@@ -72,63 +45,74 @@ def ocr_image(image):
     pil_img = Image.fromarray(processed)
 
     config = (
-        "--oem 3 --psm 4 "
+        "--oem 3 --psm 6 "
         "-l eng "
-        "-c preserve_interword_spaces=1 "
-        "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.$:/-%#&() "
+        "-c preserve_interword_spaces=1"
     )
 
     text = pytesseract.image_to_string(pil_img, config=config)
-
     return text, pil_img
 
 
-def parse_items_with_gpt(text):
+def parse_receipt_image_with_gpt(image):
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-    prompt = f"""
-You are parsing OCR text from an Australian retail receipt.
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=90)
+    image_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    prompt = """
+You are reading an Australian retail receipt image.
 
 Return ONLY valid JSON array. No markdown. No explanation.
 
 Each object must have:
 [
-  {{
+  {
     "Item": "item description",
     "Qty": "",
     "Unit Price": "",
     "Amount": 0.00
-  }}
+  }
 ]
 
 Rules:
-- Only include purchased line items.
-- Exclude store name, ABN, phone number, date, subtotal, total, GST, cash, change, barcode footer, flybuys, advertising text.
-- Do not invent items that are not clearly supported by OCR text.
-- If unsure about item name, keep the OCR-like wording.
-- Amount must be close to a visible price in the OCR text.
-- Ignore random isolated numbers unless they look like prices.
-- Australian receipt prices usually appear like 3.50, 12.99, 120.00.
-- If quantity and unit price are visible, calculate Amount = Qty * Unit Price.
-- If line total is visible on the right, use that as Amount.
-- If no clear amount is visible, use 0.
+- Extract all purchased line items.
+- Do not include subtotal, total, GST, payment, cash, change, ABN, phone number, footer, barcode, rewards text, advertising text.
+- Preserve item descriptions as accurately as possible.
+- Amount must be the line item amount, not the receipt total.
+- If quantity and unit price are visible, fill them.
+- If quantity or unit price are unclear, keep them empty.
+- If an item amount is unclear, use 0.
 - Return Amount as number, not string.
-
-OCR text:
-{text}
+- Do not invent items.
 """
 
     response = client.responses.create(
         model="gpt-4.1-mini",
-        input=prompt
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{image_base64}"
+                    }
+                ]
+            }
+        ]
     )
 
     raw = response.output_text.strip()
 
     try:
-        return json.loads(raw)
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        return []
     except Exception:
-        st.error("GPT returned invalid JSON")
+        st.error("GPT Vision returned invalid JSON")
         st.text(raw)
         return []
 
@@ -275,19 +259,6 @@ def find_drive_file(file_name, folder_id):
     return None
 
 
-def download_drive_file(file_id, local_path):
-    service = get_drive_service_oauth()
-
-    request = service.files().get_media(fileId=file_id)
-
-    with io.FileIO(local_path, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-
-        done = False
-        while not done:
-            status, done = downloader.next_chunk()
-
-
 def update_drive_file(file_id, local_path):
     service = get_drive_service_oauth()
 
@@ -332,18 +303,41 @@ uploaded_file = st.file_uploader(
 if uploaded_file:
     original_image = Image.open(uploaded_file)
 
+    # Fix mobile photo rotation
+    original_image = ImageOps.exif_transpose(original_image)
+
+    # Compress large mobile photos
     original_image.thumbnail((1600, 1600))
 
     st.subheader("Original Image")
     st.image(original_image, use_container_width=True)
 
-    if st.button("🔍 Run OCR", use_container_width=True):
-        with st.spinner("Preprocessing image and running OCR..."):
-            ocr_text, processed_image = ocr_image(original_image)
+    col1, col2 = st.columns(2)
 
-        st.session_state["ocr_text"] = ocr_text
-        st.session_state["processed_image"] = processed_image
-        st.session_state["items_df"] = None
+    with col1:
+        if st.button("🤖 Read Receipt with GPT Vision", use_container_width=True):
+            with st.spinner("Reading receipt image with GPT Vision..."):
+                items = parse_receipt_image_with_gpt(original_image)
+
+            if items:
+                st.session_state["items_df"] = pd.DataFrame(items)
+                st.success(f"GPT Vision found {len(items)} item rows")
+            else:
+                st.session_state["items_df"] = pd.DataFrame([{
+                    "Item": "",
+                    "Qty": "",
+                    "Unit Price": "",
+                    "Amount": 0.0
+                }])
+                st.warning("No items detected. You can manually enter items below.")
+
+    with col2:
+        if st.button("🧪 Debug OCR", use_container_width=True):
+            with st.spinner("Running OCR debug..."):
+                ocr_text, processed_image = ocr_image(original_image)
+
+            st.session_state["ocr_text"] = ocr_text
+            st.session_state["processed_image"] = processed_image
 
     if "ocr_text" in st.session_state:
         with st.expander("Show processed OCR image"):
@@ -352,21 +346,16 @@ if uploaded_file:
         with st.expander("Show OCR text"):
             st.text_area("OCR Text", st.session_state["ocr_text"], height=220)
 
-        if st.button("🤖 Process Receipt with GPT", use_container_width=True):
-            try:
-                with st.spinner("Parsing receipt with GPT..."):
-                    items = parse_items_with_gpt(st.session_state["ocr_text"])
-
-                st.session_state["items_df"] = pd.DataFrame(items)
-                st.success(f"GPT found {len(items)} item rows")
-
-            except Exception as e:
-                st.error("GPT parsing failed")
-                st.exception(e)
-                st.session_state["items_df"] = None
-
     if "items_df" in st.session_state and st.session_state["items_df"] is not None:
         st.subheader("Confirm / Edit Items")
+
+        if st.session_state["items_df"].empty:
+            st.session_state["items_df"] = pd.DataFrame([{
+                "Item": "",
+                "Qty": "",
+                "Unit Price": "",
+                "Amount": 0.0
+            }])
 
         edited_rows = []
 
@@ -411,7 +400,27 @@ if uploaded_file:
                     "Amount": amount
                 })
 
+        if st.button("➕ Add another item", use_container_width=True):
+            st.session_state["items_df"] = pd.concat([
+                st.session_state["items_df"],
+                pd.DataFrame([{
+                    "Item": "",
+                    "Qty": "",
+                    "Unit Price": "",
+                    "Amount": 0.0
+                }])
+            ], ignore_index=True)
+            st.rerun()
+
         edited_df = pd.DataFrame(edited_rows)
+
+        if edited_df.empty or "Amount" not in edited_df.columns:
+            edited_df = pd.DataFrame([{
+                "Item": "",
+                "Qty": "",
+                "Unit Price": "",
+                "Amount": 0.0
+            }])
 
         st.subheader("Receipt Details")
 
@@ -431,8 +440,6 @@ if uploaded_file:
 
         if st.button("✅ Confirm and Save", use_container_width=True):
             date_obj = datetime.combine(receipt_date, datetime.min.time())
-
-            total_amount = edited_df["Amount"].sum()
 
             image_path = save_image(
                 original_image,
