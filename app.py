@@ -24,31 +24,49 @@ def get_financial_year(date):
     return f"FY{date.year - 1}-{date.year}"
 
 
-def preprocess_image(image):
+def preprocess_versions(image):
     img = np.array(image.convert("RGB"))
 
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    mask = gray > 20
-    coords = np.argwhere(mask)
 
-    if coords.size > 0:
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1
-        img = img[y0:y1, x0:x1]
+    versions = []
 
-    img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    versions.append(gray)
 
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    gray = cv2.equalizeHist(gray)
-    gray = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)[1]
+    resized = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    versions.append(resized)
 
-    return Image.fromarray(gray)
+    threshold = cv2.threshold(resized, 150, 255, cv2.THRESH_BINARY)[1]
+    versions.append(threshold)
+
+    adaptive = cv2.adaptiveThreshold(
+        resized,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+    versions.append(adaptive)
+
+    return versions
 
 
 def ocr_image(image):
-    processed = preprocess_image(image)
-    text = pytesseract.image_to_string(processed, config="--psm 6")
-    return text, processed
+    versions = preprocess_versions(image)
+
+    best_text = ""
+    best_img = versions[0]
+
+    for v in versions:
+        pil_img = Image.fromarray(v)
+        text = pytesseract.image_to_string(pil_img, config="--psm 6")
+
+        if len(text.strip()) > len(best_text.strip()):
+            best_text = text
+            best_img = pil_img
+
+    return best_text, best_img
 
 
 def parse_items_with_gpt(text):
@@ -72,9 +90,13 @@ Each object must have:
 Rules:
 - Only include purchased line items.
 - Exclude store name, ABN, phone number, date, subtotal, total, GST, cash, change, barcode footer, flybuys, advertising text.
+- Do not invent items that are not clearly supported by OCR text.
+- If unsure about item name, keep the OCR-like wording.
+- Amount must be close to a visible price in the OCR text.
+- Ignore random isolated numbers unless they look like prices.
+- Australian receipt prices usually appear like 3.50, 12.99, 120.00.
 - If quantity and unit price are visible, calculate Amount = Qty * Unit Price.
 - If line total is visible on the right, use that as Amount.
-- If OCR is messy, infer the most likely item rows.
 - Return Amount as number, not string.
 
 OCR text:
@@ -142,7 +164,6 @@ def create_google_flow():
         redirect_uri=st.secrets["auth"]["redirect_uri"],
         autogenerate_code_verifier=False
     )
-
     return flow
 
 
@@ -160,11 +181,6 @@ def google_login_section():
             code = query_params["code"]
 
             flow = create_google_flow()
-
-            # restore saved PKCE verifier
-            if "google_code_verifier" in st.session_state:
-                flow.code_verifier = st.session_state["google_code_verifier"]
-
             flow.fetch_token(code=code)
 
             st.session_state["google_credentials"] = flow.credentials
@@ -185,10 +201,6 @@ def google_login_section():
         include_granted_scopes="true",
         prompt="consent",
     )
-
-    # save PKCE verifier before redirect
-    st.session_state["google_code_verifier"] = flow.code_verifier
-    st.session_state["google_oauth_state"] = state
 
     st.markdown(f"[Login with Google Drive]({auth_url})")
 
@@ -224,54 +236,102 @@ def upload_to_drive(file_path, file_name, folder_id):
     return uploaded_file.get("id")
 
 
-st.title("📸 Receipt Scanner - GPT + Personal Google Drive")
+st.title("📸 Receipt Scanner")
 
 google_login_section()
 
 uploaded_file = st.file_uploader(
-    "Upload receipt image",
-    type=["jpg", "jpeg", "png"]
+    "Take or upload receipt photo",
+    type=["jpg", "jpeg", "png"],
+    help="On mobile, choose Camera to take a receipt photo directly."
 )
 
 if uploaded_file:
     original_image = Image.open(uploaded_file)
 
+    # Mobile optimization: compress large phone photos
+    original_image.thumbnail((1600, 1600))
+
     st.subheader("Original Image")
     st.image(original_image, use_container_width=True)
 
-    with st.spinner("Preprocessing image and running OCR..."):
-        ocr_text, processed_image = ocr_image(original_image)
+    if st.button("🔍 Run OCR", use_container_width=True):
+        with st.spinner("Preprocessing image and running OCR..."):
+            ocr_text, processed_image = ocr_image(original_image)
 
-    st.subheader("Processed OCR Image")
-    st.image(processed_image, use_container_width=True)
+        st.session_state["ocr_text"] = ocr_text
+        st.session_state["processed_image"] = processed_image
+        st.session_state["items_df"] = None
 
-    st.subheader("OCR Text")
-    st.text_area("OCR Text", ocr_text, height=250)
+    if "ocr_text" in st.session_state:
+        with st.expander("Show processed OCR image"):
+            st.image(st.session_state["processed_image"], use_container_width=True)
 
-    if "items_df" not in st.session_state:
-        st.session_state.items_df = None
+        with st.expander("Show OCR text"):
+            st.text_area("OCR Text", st.session_state["ocr_text"], height=220)
 
-    if st.button("Process Receipt"):
-        try:
-            with st.spinner("Parsing receipt with GPT, please wait 5-20 seconds..."):
-                items = parse_items_with_gpt(ocr_text)
+        if st.button("🤖 Process Receipt with GPT", use_container_width=True):
+            try:
+                with st.spinner("Parsing receipt with GPT..."):
+                    items = parse_items_with_gpt(st.session_state["ocr_text"])
 
-            st.session_state.items_df = pd.DataFrame(items)
-            st.success(f"GPT found {len(items)} item rows")
+                st.session_state["items_df"] = pd.DataFrame(items)
+                st.success(f"GPT found {len(items)} item rows")
 
-        except Exception as e:
-            st.error("GPT parsing failed")
-            st.exception(e)
-            st.session_state.items_df = None
+            except Exception as e:
+                st.error("GPT parsing failed")
+                st.exception(e)
+                st.session_state["items_df"] = None
 
-    if st.session_state.items_df is not None:
-        st.subheader("Confirm / Edit Items Before Saving")
+    if "items_df" in st.session_state and st.session_state["items_df"] is not None:
+        st.subheader("Confirm / Edit Items")
 
-        edited_df = st.data_editor(
-            st.session_state.items_df,
-            num_rows="dynamic",
-            use_container_width=True
-        )
+        edited_rows = []
+
+        for i, row in st.session_state["items_df"].iterrows():
+            item_name = str(row.get("Item", ""))
+
+            with st.expander(f"Item {i + 1}: {item_name}", expanded=True):
+                item = st.text_input(
+                    "Item",
+                    value=str(row.get("Item", "")),
+                    key=f"item_{i}"
+                )
+
+                qty = st.text_input(
+                    "Qty",
+                    value=str(row.get("Qty", "")),
+                    key=f"qty_{i}"
+                )
+
+                unit_price = st.text_input(
+                    "Unit Price",
+                    value=str(row.get("Unit Price", "")),
+                    key=f"unit_{i}"
+                )
+
+                try:
+                    default_amount = float(row.get("Amount", 0) or 0)
+                except Exception:
+                    default_amount = 0.0
+
+                amount = st.number_input(
+                    "Amount",
+                    value=default_amount,
+                    step=0.01,
+                    key=f"amount_{i}"
+                )
+
+                edited_rows.append({
+                    "Item": item,
+                    "Qty": qty,
+                    "Unit Price": unit_price,
+                    "Amount": amount
+                })
+
+        edited_df = pd.DataFrame(edited_rows)
+
+        st.subheader("Receipt Details")
 
         store = st.text_input("Store", value="Bunnings")
         category = st.text_input("Category", value="Materials")
@@ -279,7 +339,10 @@ if uploaded_file:
         payment_method = st.text_input("Payment Method", value="")
         receipt_date = st.date_input("Receipt Date", value=datetime.today())
 
-        if st.button("Confirm and Save"):
+        total_amount = edited_df["Amount"].sum()
+        st.info(f"Total Amount: ${total_amount:.2f}")
+
+        if st.button("✅ Confirm and Save", use_container_width=True):
             date_obj = datetime.combine(receipt_date, datetime.min.time())
 
             edited_df["Amount"] = pd.to_numeric(
@@ -329,9 +392,7 @@ if uploaded_file:
                 )
 
                 if excel_drive_id and image_drive_id:
-                    st.success("✅ Saved and uploaded to your Google Drive")
-                    st.write("Excel Drive file ID:", excel_drive_id)
-                    st.write("Receipt image Drive file ID:", image_drive_id)
+                    st.success("✅ Saved to Google Drive")
 
             except Exception as e:
                 st.error("Google Drive upload failed")
@@ -342,7 +403,8 @@ if uploaded_file:
                     "Download Excel backup",
                     f,
                     file_name=os.path.basename(excel_path),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
                 )
 
             with open(image_path, "rb") as f:
@@ -350,5 +412,6 @@ if uploaded_file:
                     "Download Receipt backup",
                     f,
                     file_name=os.path.basename(image_path),
-                    mime="image/jpeg"
+                    mime="image/jpeg",
+                    use_container_width=True
                 )
