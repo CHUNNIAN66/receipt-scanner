@@ -296,7 +296,7 @@ def get_receipt_image_folder_id(root_folder_id, date_obj, store):
     )
 
     store_folder_id = get_or_create_drive_folder(
-        store,
+        safe_name(store),
         fy_folder_id
     )
 
@@ -522,10 +522,9 @@ if uploaded_file:
             items = parse_receipt_image_with_gpt(original_image)
 
         if items:
-            st.session_state["items_df"] = pd.DataFrame(items)
-            st.success(f"Found {len(items)} item rows")
+            df = pd.DataFrame(items)
         else:
-            st.session_state["items_df"] = pd.DataFrame([
+            df = pd.DataFrame([
                 {
                     "Item": "",
                     "Qty": "",
@@ -535,14 +534,39 @@ if uploaded_file:
             ])
             st.warning("No items detected. You can manually enter items below.")
 
+        # Add editable Store and Category columns into the table.
+        # These values will be saved later from edited_df, not from separate default inputs.
+        if "Store" not in df.columns:
+            df.insert(0, "Store", "Bunnings")
+
+        if "Category" not in df.columns:
+            df.insert(1, "Category", "Materials")
+
+        st.session_state["items_df"] = df
+        st.success(f"Found {len(df)} item rows")
+
     if "items_df" in st.session_state:
         st.subheader("Edit Receipt Items")
 
-        required_columns = ["Item", "Qty", "Unit Price", "Amount"]
+        required_columns = [
+            "Store",
+            "Category",
+            "Item",
+            "Qty",
+            "Unit Price",
+            "Amount"
+        ]
 
         for col in required_columns:
             if col not in st.session_state["items_df"].columns:
-                st.session_state["items_df"][col] = ""
+                if col == "Store":
+                    st.session_state["items_df"][col] = "Bunnings"
+                elif col == "Category":
+                    st.session_state["items_df"][col] = "Materials"
+                elif col == "Amount":
+                    st.session_state["items_df"][col] = 0.0
+                else:
+                    st.session_state["items_df"][col] = ""
 
         st.session_state["items_df"] = st.session_state["items_df"][required_columns]
 
@@ -552,6 +576,14 @@ if uploaded_file:
             use_container_width=True,
             hide_index=True,
             column_config={
+                "Store": st.column_config.TextColumn(
+                    "Store / Supplier",
+                    width="medium"
+                ),
+                "Category": st.column_config.TextColumn(
+                    "Category",
+                    width="medium"
+                ),
                 "Item": st.column_config.TextColumn(
                     "Item",
                     width="large"
@@ -576,6 +608,8 @@ if uploaded_file:
         if edited_df.empty or "Amount" not in edited_df.columns:
             edited_df = pd.DataFrame([
                 {
+                    "Store": "Bunnings",
+                    "Category": "Materials",
                     "Item": "",
                     "Qty": "",
                     "Unit Price": "",
@@ -585,8 +619,6 @@ if uploaded_file:
 
         st.subheader("Receipt Details")
 
-        store = st.text_input("Store", value="Bunnings")
-        category = st.text_input("Category", value="Materials")
         project = st.text_input("Project / Investor", value="")
         payment_method = st.text_input("Payment Method", value="")
         receipt_date = st.date_input("Receipt Date", value=datetime.today())
@@ -603,9 +635,18 @@ if uploaded_file:
         if st.button("✅ Confirm and Save", use_container_width=True):
             date_obj = datetime.combine(receipt_date, datetime.min.time())
 
+            # Use the first non-empty store value for image folder/file naming.
+            valid_stores = edited_df["Store"].dropna().astype(str).str.strip()
+            valid_stores = valid_stores[valid_stores != ""]
+
+            if not valid_stores.empty:
+                receipt_store_for_image = valid_stores.iloc[0]
+            else:
+                receipt_store_for_image = "Unknown_Store"
+
             image_path = save_image_local(
                 original_image,
-                store,
+                receipt_store_for_image,
                 date_obj,
                 round(float(total_amount), 2)
             )
@@ -613,22 +654,33 @@ if uploaded_file:
             rows = []
 
             for _, row in edited_df.iterrows():
+                item = str(row.get("Item", "")).strip()
+                amount = row.get("Amount", 0)
+
+                # Skip completely empty rows from the dynamic editor.
+                if item == "" and float(amount or 0) == 0:
+                    continue
+
                 rows.append({
                     "Date": date_obj.strftime("%Y-%m-%d"),
-                    "Store": store,
+                    "Store": row.get("Store", ""),
+                    "Category": row.get("Category", ""),
                     "Item": row.get("Item", ""),
                     "Qty": row.get("Qty", ""),
                     "Unit Price": row.get("Unit Price", ""),
                     "Amount": row.get("Amount", ""),
-                    "Category": category,
                     "Project / Investor": project,
                     "Payment Method": payment_method,
                     "Image Path": os.path.basename(image_path)
                 })
 
+            if not rows:
+                st.error("No valid rows to save. Please enter at least one item or amount.")
+                st.stop()
+
             user_email = st.session_state["user_email"]
             root_folder_id = get_user_root_folder_id(user_email)
-            
+
             excel_path = save_to_excel(
                 rows,
                 date_obj,
@@ -645,7 +697,7 @@ if uploaded_file:
                 receipt_image_folder_id = get_receipt_image_folder_id(
                     root_folder_id,
                     date_obj,
-                    store
+                    receipt_store_for_image
                 )
 
                 image_drive_id = upload_to_drive(
